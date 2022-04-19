@@ -16,10 +16,10 @@ use crate::{
     storage_synchronizer::StorageSynchronizerInterface,
     utils,
 };
-use ::aptos_logger::*;
 use aptos_config::config::{RoleType, StateSyncDriverConfig};
 use aptos_data_client::AptosDataClient;
 use aptos_infallible::Mutex;
+use aptos_logger::prelude::*;
 use aptos_types::waypoint::Waypoint;
 use consensus_notifications::{
     ConsensusCommitNotification, ConsensusNotification, ConsensusSyncNotification,
@@ -32,6 +32,9 @@ use std::{sync::Arc, time::SystemTime};
 use storage_interface::DbReader;
 use tokio::time::{interval, Duration};
 use tokio_stream::wrappers::IntervalStream;
+
+// Useful constants for the driver
+const DRIVER_ERROR_LOG_FREQ_SECS: u64 = 1;
 
 /// The configuration of the state sync driver
 #[derive(Clone)]
@@ -240,17 +243,14 @@ impl<
         &mut self,
         consensus_commit_notification: ConsensusCommitNotification,
     ) -> Result<(), Error> {
-        debug!(
+        info!(
             LogSchema::new(LogEntry::ConsensusNotification).message(&format!(
                 "Received a consensus commit notification! Total transactions: {:?}, events: {:?}",
                 consensus_commit_notification.transactions.len(),
                 consensus_commit_notification.reconfiguration_events.len()
             ))
         );
-        metrics::increment_counter(
-            &metrics::DRIVER_COUNTERS,
-            metrics::DRIVER_CONSENSUS_COMMIT_NOTIFICATION,
-        );
+        self.update_consensus_commit_metrics(&consensus_commit_notification);
 
         // TODO(joshlind): can we get consensus to forward the events?
 
@@ -278,13 +278,36 @@ impl<
         self.check_sync_request_progress().await
     }
 
+    /// Updates the storage synchronizer operations based on a consensus commit
+    /// notification
+    fn update_consensus_commit_metrics(
+        &self,
+        consensus_commit_notification: &ConsensusCommitNotification,
+    ) {
+        let num_transactions = consensus_commit_notification.transactions.len() as u64;
+        metrics::increment_counter(
+            &metrics::DRIVER_COUNTERS,
+            metrics::DRIVER_CONSENSUS_COMMIT_NOTIFICATION,
+        );
+        metrics::increment_gauge(
+            &metrics::STORAGE_SYNCHRONIZER_OPERATIONS,
+            metrics::StorageSynchronizerOperations::ExecutedTransactions.get_label(),
+            num_transactions,
+        );
+        metrics::increment_gauge(
+            &metrics::STORAGE_SYNCHRONIZER_OPERATIONS,
+            metrics::StorageSynchronizerOperations::SyncedTransactions.get_label(),
+            num_transactions,
+        );
+    }
+
     /// Handles a consensus notification to sync to a specified target
     async fn handle_consensus_sync_notification(
         &mut self,
         sync_notification: ConsensusSyncNotification,
     ) -> Result<(), Error> {
         let latest_synced_version = utils::fetch_latest_synced_version(self.storage.clone())?;
-        debug!(
+        info!(
             LogSchema::new(LogEntry::ConsensusNotification).message(&format!(
             "Received a consensus sync notification! Target version: {:?}. Latest synced version: {:?}",
             sync_notification.target, latest_synced_version,
@@ -434,6 +457,14 @@ impl<
             self.handle_committed_transactions(committed_transactions)
                 .await;
         }
+
+        // Update the last commit timestamp for the sync request
+        let consensus_sync_request = self
+            .consensus_notification_handler
+            .get_consensus_sync_request();
+        if let Some(sync_request) = consensus_sync_request.lock().as_mut() {
+            sync_request.update_last_commit_timestamp()
+        };
     }
 
     /// Handles an error notification sent by the storage synchronizer
@@ -567,15 +598,21 @@ impl<
                 .drive_progress(consensus_sync_request)
                 .await
             {
-                error!(LogSchema::new(LogEntry::Driver)
-                    .error(&error)
-                    .message("Error found when driving progress of the continuous syncer!"));
+                sample!(
+                    SampleRate::Duration(Duration::from_secs(DRIVER_ERROR_LOG_FREQ_SECS)),
+                    error!(LogSchema::new(LogEntry::Driver)
+                        .error(&error)
+                        .message("Error found when driving progress of the continuous syncer!"));
+                );
                 metrics::increment_counter(&metrics::CONTINUOUS_SYNCER_ERRORS, error.get_label());
             }
         } else if let Err(error) = self.bootstrapper.drive_progress(&global_data_summary).await {
-            error!(LogSchema::new(LogEntry::Driver)
-                .error(&error)
-                .message("Error found when checking the bootstrapper progress!"));
+            sample!(
+                    SampleRate::Duration(Duration::from_secs(DRIVER_ERROR_LOG_FREQ_SECS)),
+                    error!(LogSchema::new(LogEntry::Driver)
+                        .error(&error)
+                        .message("Error found when checking the bootstrapper progress!"));
+            );
             metrics::increment_counter(&metrics::BOOTSTRAPPER_ERRORS, error.get_label());
         };
     }
