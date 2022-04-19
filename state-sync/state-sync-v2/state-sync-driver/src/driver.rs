@@ -423,14 +423,6 @@ impl<
                 .error(&error)
                 .message("Failed to handle a transaction commit notification!"));
         }
-
-        // Update the last commit timestamp for the sync request
-        let consensus_sync_request = self
-            .consensus_notification_handler
-            .get_consensus_sync_request();
-        if let Some(sync_request) = consensus_sync_request.lock().as_mut() {
-            sync_request.update_last_commit_timestamp()
-        };
     }
 
     /// Handles a notification sent by the storage synchronizer for committed accounts
@@ -457,14 +449,6 @@ impl<
             self.handle_committed_transactions(committed_transactions)
                 .await;
         }
-
-        // Update the last commit timestamp for the sync request
-        let consensus_sync_request = self
-            .consensus_notification_handler
-            .get_consensus_sync_request();
-        if let Some(sync_request) = consensus_sync_request.lock().as_mut() {
-            sync_request.update_last_commit_timestamp()
-        };
     }
 
     /// Handles an error notification sent by the storage synchronizer
